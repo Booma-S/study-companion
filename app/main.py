@@ -8,5 +8,6 @@ app = FastAPI()
 @app.get("/")
 def root():
     return {
-        "database": settings.database_url
+        "algorithm": settings.algorithm,
+        "expiry": settings.access_token_expire_minutes,
     }
