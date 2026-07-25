@@ -6,6 +6,10 @@ from app.db.database import get_db
 from app.schemas.user import UserCreate, UserResponse
 from app.services.auth_service import register_user
 
+from app.schemas.auth import LoginRequest
+from app.schemas.token import Token
+from app.services.auth_service import login_user
+
 router = APIRouter(
     prefix="/auth",
     tags=["Authentication"],
@@ -23,19 +27,22 @@ router = APIRouter(
         409: {"description": "Email already registered"},
     },
 )
-
-def register(
-    user_data: UserCreate,
-    db: Session = Depends(get_db),
-):
+def register(user_data: UserCreate, db: Session = Depends(get_db),):
     try:
-        return register_user(
-            db,
-            user_data
-        )
-
+        return register_user(db, user_data)
     except EmailAlreadyExistsError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
+    
+@router.post("/login", response_model=Token, summary="Login user",)
+
+def login(login_data: LoginRequest, db: Session = Depends(get_db),):
+    try:
+        return login_user(db, login_data)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(exc),
         )
