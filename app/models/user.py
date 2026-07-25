@@ -2,7 +2,7 @@ from datetime import datetime, UTC
 
 from sqlalchemy import Boolean, DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
-
+from sqlalchemy.orm import relationship
 from app.db.database import Base
 
 
@@ -40,4 +40,10 @@ class User(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
         nullable=False
+    )
+
+    documents = relationship(
+        "Document",
+        back_populates="owner",
+        cascade="all, delete-orphan",
     )
