@@ -25,3 +25,11 @@ def create_document(
     db.refresh(document)
 
     return document
+
+def get_user_documents(db: Session, owner_id: int,):
+    return (
+        db.query(Document)
+        .filter(Document.owner_id == owner_id)
+        .order_by(Document.uploaded_at.desc())
+        .all()
+    )

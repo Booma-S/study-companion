@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
-
+from typing import List
 
 class DocumentResponse(BaseModel):
     id: int
@@ -11,3 +11,5 @@ class DocumentResponse(BaseModel):
     uploaded_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+DocumentListResponse = List[DocumentResponse]
