@@ -13,6 +13,7 @@ from app.services.document_service import create_document
 
 from app.services.document_service import get_user_documents
 from app.schemas.document import DocumentListResponse
+from app.services.document_service import get_document_by_id
 
 router = APIRouter()
 
@@ -73,3 +74,33 @@ def list_documents(
         db,
         current_user.id,
     )
+
+@router.get(
+    "/{document_id}",
+    response_model=DocumentResponse,
+    summary="Get a document",
+)
+def get_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+
+    document = get_document_by_id(
+        db,
+        document_id,
+    )
+
+    if document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
+        )
+
+    if document.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to access this document.",
+        )
+
+    return document

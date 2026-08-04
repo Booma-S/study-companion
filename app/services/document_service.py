@@ -33,3 +33,10 @@ def get_user_documents(db: Session, owner_id: int,):
         .order_by(Document.uploaded_at.desc())
         .all()
     )
+
+def get_document_by_id(db: Session, document_id: int,):
+    return (
+        db.query(Document)
+        .filter(Document.id == document_id)
+        .first()
+    )
