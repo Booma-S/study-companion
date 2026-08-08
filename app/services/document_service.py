@@ -40,3 +40,7 @@ def get_document_by_id(db: Session, document_id: int,):
         .filter(Document.id == document_id)
         .first()
     )
+
+def delete_document(db: Session, document: Document,) -> None:
+    db.delete(document)
+    db.commit()

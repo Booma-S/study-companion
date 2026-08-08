@@ -21,7 +21,7 @@ from app.schemas.document import (
     DocumentResponse,
 )
 from app.services.document_service import (
-    create_document,get_document_by_id,get_user_documents,)
+    create_document,get_document_by_id,get_user_documents,delete_document,)
 
 router = APIRouter()
 
@@ -134,3 +134,36 @@ def get_document(
 
     return document
 
+@router.delete(
+    "/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a document",
+)
+def remove_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    document = get_document_by_id(
+        db,
+        document_id,
+    )
+
+    if document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
+        )
+
+    if document.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to delete this document.",
+        )
+
+    file_path = Path(document.file_path)
+
+    if file_path.is_file():
+        file_path.unlink()
+
+    delete_document(db, document)
