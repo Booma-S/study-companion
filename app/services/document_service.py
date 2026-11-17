@@ -10,14 +10,15 @@ def create_document(
     file_path: str,
     file_size: int,
     owner_id: int,
-) -> Document:
-
+    extracted_text: str | None = None,
+):
     document = Document(
         filename=filename,
         file_type=file_type,
         file_path=file_path,
         file_size=file_size,
         owner_id=owner_id,
+        extracted_text=extracted_text,
     )
 
     db.add(document)

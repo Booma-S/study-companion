@@ -19,9 +19,13 @@ from app.models.user import User
 from app.schemas.document import (
     DocumentListResponse,
     DocumentResponse,
+    DocumentTextResponse,
 )
 from app.services.document_service import (
     create_document,get_document_by_id,get_user_documents,delete_document,)
+
+from app.services.text_extraction_service import extract_text
+from app.services.text_cleaning_service import clean_extracted_text
 
 router = APIRouter()
 
@@ -56,6 +60,28 @@ def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db),
     with file_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
+    try:
+        extracted_text = extract_text(
+            str(file_path),
+            extension.lstrip("."),
+        )
+        extracted_text = clean_extracted_text(extracted_text)
+    except FileNotFoundError:
+        file_path.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Uploaded file could not be found.",
+        )
+
+    except ValueError as exc:
+        file_path.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
     document = create_document(
         db=db,
         filename=file.filename,
@@ -63,6 +89,7 @@ def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db),
         file_path=str(file_path),
         file_size=file_path.stat().st_size,
         owner_id=current_user.id,
+        extracted_text=extracted_text,
     )
     return document
 
@@ -106,6 +133,66 @@ def download_document(
         path=file_path,
         filename=document.filename,
         media_type="application/octet-stream",
+    )
+
+@router.get(
+    "/{document_id}/text",
+    response_model=DocumentTextResponse,
+    summary="Extract text from a document",)
+def extract_document_text(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    document = get_document_by_id(
+        db,
+        document_id,
+    )
+
+    if document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
+        )
+
+    if document.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to access this document.",
+        )
+
+    # If we already extracted and stored the text at upload time,
+    # reuse it instead of re-running (slow) OCR on every request.
+    if document.extracted_text is not None:
+        return DocumentTextResponse(
+            document_id=document.id,
+            filename=document.filename,
+            text=document.extracted_text,
+        )
+
+    try:
+        text = extract_text(
+            document.file_path,
+            document.file_type,
+        )
+        text = clean_extracted_text(text)
+
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found on server.",
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    return DocumentTextResponse(
+        document_id=document.id,
+        filename=document.filename,
+        text=text,
     )
 
 @router.get("/{document_id}", response_model=DocumentResponse, summary="Get a document",)
