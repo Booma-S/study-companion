@@ -7,10 +7,29 @@ import numpy as np
 from rapidocr_onnxruntime import RapidOCR
 from wordsegment import UNIGRAMS, load, segment
 
-# Initialize wordsegment once
+# Initialize wordsegment without mutating library global UNIGRAMS
 load()
-for compound_word in ["helloworld", "iam", "fromthe", "companionapplication"]:
-    UNIGRAMS.pop(compound_word, None)
+
+# Whitelist of actual software packages, tools, programming languages, and databases.
+# Legitimate technology names must NOT be split.
+TECH_LIBRARIES_AND_TOOLS = {
+    "tensorflow", "pytorch", "keras", "postgresql", "postgres",
+    "sqlite", "mysql", "mongodb", "redis", "fastapi", "sqlalchemy",
+    "pydantic", "alembic", "docker", "kubernetes", "devops",
+    "github", "gitlab", "javascript", "typescript", "python",
+    "scikit", "scikitlearn", "numpy", "pandas", "scipy",
+    "matplotlib", "seaborn", "opencv", "rapidocr", "pymupdf",
+    "tesseract", "graphql", "jwt",
+}
+
+# Known OCR compound mergers to explicitly expand without mutating library globals
+KNOWN_MERGED_COMPOUNDS = {
+    "helloworld": ["hello", "world"],
+    "iam": ["i", "am"],
+    "fromthe": ["from", "the"],
+    "companionapplication": ["companion", "application"],
+    "totest": ["to", "test"],
+}
 
 _ocr_instance: RapidOCR | None = None
 _ocr_lock = threading.Lock()
@@ -25,25 +44,37 @@ def get_ocr_engine() -> RapidOCR:
     return _ocr_instance
 
 
-def preprocess_image(image: np.ndarray) -> np.ndarray:
+def preprocess_image(image: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
     """
     Conditionally preprocess an image to improve OCR recognition:
     - Resolution enhancement for small images.
     - Deskewing if the image is tilted.
     - CLAHE contrast enhancement for faded or low-contrast images.
     Clean, high-quality images are left unchanged.
-    """
-    if image is None or image.size == 0:
-        return image
 
-    h, w = image.shape[:2]
+    Returns the processed image and transformation metadata needed to
+    reverse coordinate mappings back to the original image space.
+    """
+    transform_info: dict[str, Any] = {
+        "scale_x": 1.0,
+        "scale_y": 1.0,
+        "rot_mat": None,
+    }
+
+    if image is None or image.size == 0:
+        return image, transform_info
+
+    orig_h, orig_w = image.shape[:2]
+    h, w = orig_h, orig_w
 
     # 1. Resolution enhancement if image is small
     if h < 800 or w < 800:
         scale = min(max(800.0 / max(h, 1), 800.0 / max(w, 1)), 3.0)
         new_w, new_h = int(w * scale), int(h * scale)
         image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-        h, w = image.shape[:2]
+        transform_info["scale_x"] = new_w / orig_w
+        transform_info["scale_y"] = new_h / orig_h
+        h, w = new_h, new_w
 
     # 2. Deskewing (conditional)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
@@ -63,6 +94,7 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
                 flags=cv2.INTER_CUBIC,
                 borderMode=cv2.BORDER_REPLICATE,
             )
+            transform_info["rot_mat"] = rot_mat
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
 
     # 3. Contrast enhancement if image is faded or low-contrast
@@ -77,24 +109,24 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
         else:
             image = clahe.apply(gray)
 
-    return image
+    return image, transform_info
 
 
 def split_merged_token(token: str) -> str:
     """
     Split concatenated OCR tokens into separate words using word segmentation
     while preserving original casing, punctuation, and hyphens.
-    Example: 'HELLOWORLD!!' -> 'HELLO WORLD!!'
-             'HELLOWORLDIAMHERETOTESTTHESTUDY-' -> 'HELLO WORLD I AM HERE TO TEST THE STUDY-'
-             'COMPANIONAPPLICATION!!' -> 'COMPANION APPLICATION!!'
+
+    - Preserves genuine technology names (e.g. TensorFlow, PostgreSQL).
+    - Preserves uppercase acronyms (e.g. BERT, API, CNN).
+    - Splits ordinary concatenated prose phrases (e.g. MachineLearning -> Machine Learning,
+      DeepLearning -> Deep Learning, StudyCompanion -> Study Companion).
     """
     match = re.match(r"^([^a-zA-Z0-9]*)([a-zA-Z0-9_-]+)([^a-zA-Z0-9]*)$", token)
     if not match:
         return token
 
     prefix, core, suffix = match.groups()
-
-    # Split sub-parts by hyphens or underscores
     parts = core.split("-")
     fixed_parts = []
 
@@ -105,17 +137,35 @@ def split_merged_token(token: str) -> str:
 
         lower = part.lower()
 
-        # If already a common single word in dictionary with high frequency, leave it
-        if lower in UNIGRAMS and (len(part) <= 7 or UNIGRAMS[lower] > 5e5):
+        # 1. Technology brand & tool whitelist (e.g. TensorFlow, PostgreSQL, PyTorch)
+        if lower in TECH_LIBRARIES_AND_TOOLS:
             fixed_parts.append(part)
             continue
 
-        # Attempt segmentation
-        segs = segment(part)
+        # 2. Uppercase acronyms (e.g. BERT, CNN, RNN, API, HTTP, PDF, DOCX)
+        if part.isupper() and 2 <= len(part) <= 6:
+            fixed_parts.append(part)
+            continue
+
+        # 3. Known single dictionary words with high frequency (unless known merger)
+        if lower in UNIGRAMS and lower not in KNOWN_MERGED_COMPOUNDS:
+            if len(part) <= 7 or UNIGRAMS[lower] > 5e5:
+                fixed_parts.append(part)
+                continue
+
+        # 4. Perform word segmentation with known merged compound expansion
+        raw_segs = segment(part)
+        segs: list[str] = []
+        for s in raw_segs:
+            s_low = s.lower()
+            if s_low in KNOWN_MERGED_COMPOUNDS:
+                segs.extend(KNOWN_MERGED_COMPOUNDS[s_low])
+            else:
+                segs.append(s)
+
         if len(segs) > 1:
             curr_idx = 0
             reconstructed_segs = []
-            valid = True
             for s in segs:
                 seg_len = len(s)
                 reconstructed_segs.append(part[curr_idx : curr_idx + seg_len])
@@ -146,23 +196,27 @@ def fix_line_spacing(line: str) -> str:
     return " ".join(fixed_tokens)
 
 
-def run_ocr_raw(image: np.ndarray) -> list[dict[str, Any]]:
+def run_ocr_raw(image: np.ndarray, min_score: float = 0.35) -> list[dict[str, Any]]:
     """
     Run RapidOCR on an image and return raw bounding box detections.
+    Filters detections below min_score to eliminate OCR noise artifacts.
+    Properly inverts both scaling and rotation transformations to map
+    coordinates back to the original image space.
     """
     if image is None or image.size == 0:
         return []
 
-    processed = preprocess_image(image)
+    processed, transform_info = preprocess_image(image)
     ocr = get_ocr_engine()
     raw_results, _ = ocr(processed)
 
     if not raw_results:
         return []
 
-    # Map coordinates back if image was resized
-    scale_y = image.shape[0] / processed.shape[0]
-    scale_x = image.shape[1] / processed.shape[1]
+    rot_mat = transform_info.get("rot_mat")
+    inv_rot_mat = cv2.invertAffineTransform(rot_mat) if rot_mat is not None else None
+    scale_x = transform_info["scale_x"]
+    scale_y = transform_info["scale_y"]
 
     detections = []
     for item in raw_results:
@@ -170,8 +224,21 @@ def run_ocr_raw(image: np.ndarray) -> list[dict[str, Any]]:
         if not text or not text.strip():
             continue
 
-        xs = [p[0] * scale_x for p in box]
-        ys = [p[1] * scale_y for p in box]
+        # Filter low confidence detections (noise artifacts)
+        if score < min_score:
+            continue
+
+        # Map box coordinates back to original unrotated, unscaled image
+        orig_points = []
+        for point in box:
+            px, py = point[0], point[1]
+            if inv_rot_mat is not None:
+                p_rot = inv_rot_mat @ np.array([px, py, 1.0])
+                px, py = p_rot[0], p_rot[1]
+            orig_points.append((px / scale_x, py / scale_y))
+
+        xs = [p[0] for p in orig_points]
+        ys = [p[1] for p in orig_points]
         x_min, x_max = min(xs), max(xs)
         y_min, y_max = min(ys), max(ys)
         stripped = text.strip()
@@ -186,26 +253,38 @@ def run_ocr_raw(image: np.ndarray) -> list[dict[str, Any]]:
                 "height": max(y_max - y_min, 1.0),
                 "width": max(x_max - x_min, 1.0),
                 "char_width": (x_max - x_min) / max(len(stripped), 1),
-                "score": score,
+                "score": float(score),
             }
         )
 
     return detections
 
 
-def reconstruct_layout_from_detections(detections: list[dict[str, Any]]) -> str:
+def reconstruct_layout_blocks(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Reconstruct OCR text with multi-column layout clustering,
-    visual reading order, and word-spacing recovery.
+    Cluster detections into individual layout blocks (columns, paragraphs, headings).
+    Each block retains its own localized bounding box (x_min, y_min, x_max, y_max)
+    and reconstructed formatted text content.
     """
     if not detections:
-        return ""
+        return []
 
     n = len(detections)
     if n == 1:
-        return fix_line_spacing(detections[0]["text"])
+        d = detections[0]
+        return [
+            {
+                "x_min": d["x_min"],
+                "y_min": d["y_min"],
+                "x_max": d["x_max"],
+                "y_max": d["y_max"],
+                "height": d["height"],
+                "width": d["width"],
+                "content": fix_line_spacing(d["text"]),
+            }
+        ]
 
-    # 1. Proximity clustering into layout blocks (columns / paragraphs)
+    # 1. Proximity clustering into layout blocks
     adj: dict[int, set[int]] = {i: set() for i in range(n)}
     for i in range(n):
         for j in range(i + 1, n):
@@ -215,22 +294,19 @@ def reconstruct_layout_from_detections(detections: list[dict[str, Any]]) -> str:
             v_dist = max(0, max(a["y_min"], b["y_min"]) - min(a["y_max"], b["y_max"]))
             avg_h = (a["height"] + b["height"]) / 2.0
 
-            # Same line: vertical centers close, horizontal distance within threshold
             is_same_line = (
                 abs((a["y_min"] + a["y_max"]) / 2.0 - (b["y_min"] + b["y_max"]) / 2.0)
                 <= avg_h * 0.5
             ) and (h_dist < avg_h * 1.5)
 
-            # Vertically stacked in same column: horizontal overlap or near, small vertical gap
             is_stacked = (h_overlap > 0 or h_dist < avg_h * 0.4) and (v_dist < avg_h * 1.2)
 
             if is_same_line or is_stacked:
                 adj[i].add(j)
                 adj[j].add(i)
 
-    # Connected components
     visited = set()
-    blocks = []
+    raw_blocks = []
     for i in range(n):
         if i in visited:
             continue
@@ -244,11 +320,11 @@ def reconstruct_layout_from_detections(detections: list[dict[str, Any]]) -> str:
                 if nbr not in visited:
                     visited.add(nbr)
                     queue.append(nbr)
-        blocks.append(comp)
+        raw_blocks.append(comp)
 
-    # 2. Sort blocks into visual reading order (top-to-bottom sections, left-to-right columns)
+    # 2. Sort blocks into visual reading order
     block_infos = []
-    for b in blocks:
+    for b in raw_blocks:
         x_min = min(it["x_min"] for it in b)
         x_max = max(it["x_max"] for it in b)
         y_min = min(it["y_min"] for it in b)
@@ -264,11 +340,8 @@ def reconstruct_layout_from_detections(detections: list[dict[str, Any]]) -> str:
             }
         )
 
-    # Sort blocks initially by top coordinate
     block_infos.sort(key=lambda bi: bi["y_min"])
-
-    # Group blocks into horizontal bands/sections
-    rows = []
+    rows: list[list[dict[str, Any]]] = []
     for bi in block_infos:
         placed = False
         for row in rows:
@@ -287,13 +360,14 @@ def reconstruct_layout_from_detections(detections: list[dict[str, Any]]) -> str:
     for row in rows:
         row.sort(key=lambda bi: bi["x_min"])
         for bi in row:
-            sorted_blocks.append(bi["block"])
+            sorted_blocks.append(bi)
 
     # 3. Assemble text inside each block
-    block_texts = []
-    for block in sorted_blocks:
+    result_blocks: list[dict[str, Any]] = []
+    for bi in sorted_blocks:
+        block = bi["block"]
         block.sort(key=lambda it: it["y_min"])
-        lines = []
+        lines: list[list[dict[str, Any]]] = []
 
         for det in block:
             det_center = (det["y_min"] + det["y_max"]) / 2.0
@@ -331,14 +405,32 @@ def reconstruct_layout_from_detections(detections: list[dict[str, Any]]) -> str:
                 reconstructed_lines.append(fixed_line.strip())
 
         if reconstructed_lines:
-            block_texts.append("\n".join(reconstructed_lines))
+            result_blocks.append(
+                {
+                    "x_min": bi["x_min"],
+                    "y_min": bi["y_min"],
+                    "x_max": bi["x_max"],
+                    "y_max": bi["y_max"],
+                    "height": bi["height"],
+                    "content": "\n".join(reconstructed_lines),
+                }
+            )
 
-    return "\n\n".join(block_texts)
+    return result_blocks
 
 
-def run_ocr(image: np.ndarray) -> str:
+def reconstruct_layout_from_detections(detections: list[dict[str, Any]]) -> str:
+    """
+    Reconstruct OCR text with multi-column layout clustering,
+    visual reading order, and word-spacing recovery.
+    """
+    blocks = reconstruct_layout_blocks(detections)
+    return "\n\n".join(b["content"] for b in blocks if b["content"].strip())
+
+
+def run_ocr(image: np.ndarray, min_score: float = 0.35) -> str:
     """
     Convenience function: runs OCR and returns reconstructed layout text.
     """
-    detections = run_ocr_raw(image)
+    detections = run_ocr_raw(image, min_score=min_score)
     return reconstruct_layout_from_detections(detections)

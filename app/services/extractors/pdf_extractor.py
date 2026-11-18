@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -8,10 +9,12 @@ import pymupdf
 from app.services.extractors.table_utils import format_table_as_markdown
 from app.services.ocr_service import (
     fix_line_spacing,
-    reconstruct_layout_from_detections,
+    reconstruct_layout_blocks,
     run_ocr,
     run_ocr_raw,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _bbox_overlap_ratio(box1: tuple[float, float, float, float], box2: tuple[float, float, float, float]) -> float:
@@ -33,6 +36,8 @@ def extract_pdf(path: Path) -> str:
     - Structured tables are extracted as markdown tables.
     - Scanned pages are processed with OCR.
     - Mixed pages reconcile native text and image OCR by coordinates to avoid duplicates.
+    - Scanned/image-based tables fallback to OCR if native table extraction is empty.
+    - Preserves individual OCR block bounding boxes so image text interleaves properly with native text.
     """
     pdf_document = pymupdf.open(str(path))
     pages_output: list[str] = []
@@ -43,14 +48,20 @@ def extract_pdf(path: Path) -> str:
         page = pdf_document[page_index]
 
         # 1. Extract structured tables
-        table_bboxes = []
-        table_elements = []
+        table_bboxes_with_content: list[tuple[float, float, float, float]] = []
+        table_elements: list[dict[str, Any]] = []
+
         try:
             tabs = page.find_tables()
             for tab in tabs:
-                table_bboxes.append(tab.bbox)
-                md = format_table_as_markdown(tab.extract())
-                if md.strip():
+                extracted_data = tab.extract()
+                md = format_table_as_markdown(extracted_data)
+                has_content = any(
+                    any((cell or "").strip() for cell in row)
+                    for row in extracted_data
+                )
+                if has_content and md.strip():
+                    table_bboxes_with_content.append(tab.bbox)
                     table_elements.append(
                         {
                             "type": "table",
@@ -61,8 +72,8 @@ def extract_pdf(path: Path) -> str:
                             "content": md.strip(),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Table extraction failed on page %d: %s", page_index + 1, exc)
 
         # 2. Extract native text blocks
         raw_blocks = page.get_text("blocks")
@@ -76,17 +87,15 @@ def extract_pdf(path: Path) -> str:
             if not text:
                 continue
 
-            # Check if block center is inside any detected table
             cx = (b[0] + b[2]) / 2.0
             cy = (b[1] + b[3]) / 2.0
             in_table = any(
                 tb[0] <= cx <= tb[2] and tb[1] <= cy <= tb[3]
-                for tb in table_bboxes
+                for tb in table_bboxes_with_content
             )
             if in_table:
                 continue
 
-            # Clean and space native text
             fixed_lines = [fix_line_spacing(l) for l in text.split("\n") if l.strip()]
             fixed_text = "\n".join(fixed_lines)
 
@@ -120,7 +129,6 @@ def extract_pdf(path: Path) -> str:
             continue
 
         # Case B: Mixed content or potentially has image text
-        # Render page pixmap and run OCR to find image-only text regions
         page_elements: list[dict[str, Any]] = []
         page_elements.extend(table_elements)
         page_elements.extend(native_blocks)
@@ -131,7 +139,7 @@ def extract_pdf(path: Path) -> str:
                 np.frombuffer(pixmap.tobytes("png"), dtype=np.uint8),
                 cv2.IMREAD_COLOR,
             )
-            detections = run_ocr_raw(img)
+            detections = run_ocr_raw(img, min_score=0.35)
 
             image_detections: list[dict[str, Any]] = []
             for d in detections:
@@ -142,13 +150,11 @@ def extract_pdf(path: Path) -> str:
                     d["y_max"] / scale,
                 )
 
-                # Check if this OCR detection overlaps with native text or tables
                 is_duplicate = False
                 for nb in native_blocks:
                     if _bbox_overlap_ratio(box_page, nb["bbox"]) > 0.35:
                         is_duplicate = True
                         break
-                    # Also check exact textual duplication
                     norm_det = d["text"].lower().replace(" ", "")
                     norm_nat = nb["content"].lower().replace(" ", "")
                     if norm_det in norm_nat and abs(box_page[1] - nb["y_min"]) < 40.0:
@@ -156,7 +162,7 @@ def extract_pdf(path: Path) -> str:
                         break
 
                 if not is_duplicate:
-                    for tb in table_bboxes:
+                    for tb in table_bboxes_with_content:
                         if _bbox_overlap_ratio(box_page, tb) > 0.35:
                             is_duplicate = True
                             break
@@ -164,25 +170,24 @@ def extract_pdf(path: Path) -> str:
                 if not is_duplicate:
                     image_detections.append(d)
 
+            # Preserve individual OCR blocks so localized image regions interleave correctly
             if image_detections:
-                ocr_image_text = reconstruct_layout_from_detections(image_detections).strip()
-                if ocr_image_text:
-                    ocr_ymin = min(d["y_min"] / scale for d in image_detections)
-                    ocr_ymax = max(d["y_max"] / scale for d in image_detections)
-                    ocr_xmin = min(d["x_min"] / scale for d in image_detections)
-                    ocr_xmax = max(d["x_max"] / scale for d in image_detections)
-                    page_elements.append(
-                        {
-                            "type": "ocr_text",
-                            "y_min": ocr_ymin,
-                            "y_max": ocr_ymax,
-                            "x_min": ocr_xmin,
-                            "x_max": ocr_xmax,
-                            "content": ocr_image_text,
-                        }
-                    )
+                ocr_blocks = reconstruct_layout_blocks(image_detections)
+                for blk in ocr_blocks:
+                    content = blk["content"].strip()
+                    if content:
+                        page_elements.append(
+                            {
+                                "type": "ocr_text",
+                                "y_min": blk["y_min"] / scale,
+                                "y_max": blk["y_max"] / scale,
+                                "x_min": blk["x_min"] / scale,
+                                "x_max": blk["x_max"] / scale,
+                                "content": content,
+                            }
+                        )
 
-        # 4. Sort page elements into reading order (top-to-bottom, left-to-right columns)
+        # 4. Sort page elements into reading order
         page_elements.sort(key=lambda el: el["y_min"])
         rows: list[list[dict[str, Any]]] = []
         for el in page_elements:

@@ -1,9 +1,13 @@
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
+
+if TYPE_CHECKING:
+    from app.models.user import User
 
 
 class Document(Base):
@@ -21,7 +25,7 @@ class Document(Base):
     owner_id: Mapped[int] = mapped_column(
         ForeignKey("users.id")
     )
-    owner = relationship("User", back_populates="documents")
+    owner: Mapped["User"] = relationship("User", back_populates="documents")
     extracted_text: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,

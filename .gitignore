@@ -4,14 +4,22 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Testing
+.pytest_cache/
 
 # Environment variables
 .env
 
-# Pytest
-.pytest_cache/
-
-# VS Code
+# IDE
 .vscode/
+.idea/
 
+# Uploaded documents
 uploads/*
+!uploads/.gitkeep
+
+# Archives
+*.zip
+

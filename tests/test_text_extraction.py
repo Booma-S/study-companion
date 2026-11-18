@@ -4,16 +4,15 @@ import pytest
 from app.services.text_extraction_service import extract_text
 from app.services.text_cleaning_service import clean_extracted_text
 
-
-UPLOADS_DIR = Path("uploads/documents")
+FIXTURES_DIR = Path("tests/fixtures")
 
 
 def test_pdf_extraction_sample():
-    pdf_files = list(UPLOADS_DIR.glob("*.pdf"))
-    if not pdf_files:
-        pytest.skip("No sample PDF files found")
+    pdf_path = FIXTURES_DIR / "sample_mixed.pdf"
+    if not pdf_path.is_file():
+        pytest.fail(f"Fixture file missing: {pdf_path}")
 
-    text = extract_text(str(pdf_files[0]), "pdf")
+    text = extract_text(str(pdf_path), "pdf")
     cleaned = clean_extracted_text(text)
 
     assert "HELLO WORLD!!" in cleaned
@@ -25,30 +24,35 @@ def test_pdf_extraction_sample():
 
 
 def test_docx_extraction_sample():
-    docx_files = list(UPLOADS_DIR.glob("*.docx"))
-    if not docx_files:
-        pytest.skip("No sample DOCX files found")
+    docx_path = FIXTURES_DIR / "sample_mixed.docx"
+    if not docx_path.is_file():
+        pytest.fail(f"Fixture file missing: {docx_path}")
 
-    # Test the multi-part docx
-    multi_docx = [f for f in docx_files if "a6d9" in f.name]
-    target = multi_docx[0] if multi_docx else docx_files[0]
-
-    text = extract_text(str(target), "docx")
+    text = extract_text(str(docx_path), "docx")
     cleaned = clean_extracted_text(text)
 
     assert "HELLO WORLD!!" in cleaned
-    if multi_docx:
-        assert "STUDY-" in cleaned
-        assert "APPLICATION!!" in cleaned
-        assert "COMPANION APPLICATION!!" in cleaned
+    assert "STUDY-" in cleaned
+    assert "APPLICATION!!" in cleaned
+    assert "COMPANION APPLICATION!!" in cleaned
+
+
+def test_docx_simple_sample():
+    docx_path = FIXTURES_DIR / "sample_simple.docx"
+    if not docx_path.is_file():
+        pytest.fail(f"Fixture file missing: {docx_path}")
+
+    text = extract_text(str(docx_path), "docx")
+    cleaned = clean_extracted_text(text)
+    assert cleaned == "HELLO WORLD!!"
 
 
 def test_pptx_extraction_sample():
-    pptx_files = list(UPLOADS_DIR.glob("*.pptx"))
-    if not pptx_files:
-        pytest.skip("No sample PPTX files found")
+    pptx_path = FIXTURES_DIR / "sample_presentation.pptx"
+    if not pptx_path.is_file():
+        pytest.fail(f"Fixture file missing: {pptx_path}")
 
-    text = extract_text(str(pptx_files[0]), "pptx")
+    text = extract_text(str(pptx_path), "pptx")
     cleaned = clean_extracted_text(text)
 
     assert "Hello" in cleaned
@@ -81,3 +85,25 @@ def test_unsupported_file_type():
 def test_file_not_found():
     with pytest.raises(FileNotFoundError, match="Document file not found"):
         extract_text("nonexistent_path_file.pdf", "pdf")
+
+
+def test_docx_header_table_extraction(tmp_path):
+    from docx import Document as DocxDocument
+    from docx.shared import Inches
+
+    doc = DocxDocument()
+    section = doc.sections[0]
+    header = section.header
+    table = header.add_table(rows=1, cols=2, width=Inches(6.0))
+    table.cell(0, 0).text = "Header Col 1"
+    table.cell(0, 1).text = "Header Col 2"
+    doc.add_paragraph("Main document body paragraph.")
+
+    file_path = tmp_path / "header_table_test.docx"
+    doc.save(str(file_path))
+
+    text = extract_text(str(file_path), "docx")
+    assert "Header Col 1" in text
+    assert "Header Col 2" in text
+    assert "Main document body paragraph." in text
+
