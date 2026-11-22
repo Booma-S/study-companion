@@ -1,12 +1,14 @@
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 
+from app.schemas.document_block import DocumentBlock, ExtractionResult
 from app.services.extractors.table_utils import format_table_as_markdown
 from app.services.ocr_service import fix_line_spacing, run_ocr
 
@@ -180,10 +182,10 @@ def _extract_chart_content(chart: Any) -> str:
     return "\n\n".join(parts)
 
 
-def _extract_shape_content(shape: Any) -> str:
+def _extract_shape_content_typed(shape: Any) -> tuple[str, str, dict[str, Any]]:
     """
-    Extract structured content from a single PowerPoint shape.
-    Handles text frames, tables, charts, and pictures with OCR.
+    Extract structured content from a single PowerPoint shape,
+    identifying semantic block type and shape metadata.
     """
     # 1. Table
     if shape.has_table:
@@ -191,7 +193,11 @@ def _extract_shape_content(shape: Any) -> str:
         for row in shape.table.rows:
             row_cells = [cell.text.strip() for cell in row.cells]
             table_rows.append(row_cells)
-        return format_table_as_markdown(table_rows).strip()
+        return (
+            format_table_as_markdown(table_rows).strip(),
+            "table",
+            {"rows": len(shape.table.rows), "cols": len(shape.table.columns)},
+        )
 
     # 2. Picture
     if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
@@ -201,26 +207,57 @@ def _extract_shape_content(shape: Any) -> str:
                 cv2.IMREAD_COLOR,
             )
             if img is not None:
-                return run_ocr(img).strip()
+                return run_ocr(img).strip(), "ocr_block", {"source": "picture_ocr"}
 
     # 3. Chart
     if shape.has_chart:
-        return _extract_chart_content(shape.chart).strip()
+        return _extract_chart_content(shape.chart).strip(), "chart", {"source": "chart"}
 
     # 4. Text frame
     if shape.has_text_frame:
         lines = []
+        is_bullet = False
         for p in shape.text_frame.paragraphs:
             p_text = fix_line_spacing(p.text.strip())
             if p_text:
                 lines.append(p_text)
-        return "\n".join(lines).strip()
+                if p_text.startswith(("- ", "* ", "• ")) or (hasattr(p, "level") and p.level and p.level > 0):
+                    is_bullet = True
+
+        joined = "\n".join(lines).strip()
+        is_title = False
+        try:
+            if shape.is_placeholder and shape.placeholder_format.type in (
+                PP_PLACEHOLDER.TITLE,
+                PP_PLACEHOLDER.CENTER_TITLE,
+            ):
+                is_title = True
+        except Exception:
+            pass
+
+        if is_title:
+            b_type = "heading"
+        elif is_bullet or (lines and (lines[0].startswith(("- ", "* ", "• ")) or re.match(r"^\d+\.\s", lines[0]))):
+            b_type = "list_item"
+        else:
+            b_type = "paragraph"
+
+        return joined, b_type, {"source": "text_frame"}
 
     # Fallback to text attribute if available
     if hasattr(shape, "text") and shape.text.strip():
-        return fix_line_spacing(shape.text.strip())
+        return fix_line_spacing(shape.text.strip()), "paragraph", {}
 
-    return ""
+    return "", "paragraph", {}
+
+
+def _extract_shape_content(shape: Any) -> str:
+    """
+    Extract structured content from a single PowerPoint shape.
+    Handles text frames, tables, charts, and pictures with OCR.
+    """
+    content, _, _ = _extract_shape_content_typed(shape)
+    return content
 
 
 def _sort_shapes_reading_order(items: list[PositionedShape]) -> list[PositionedShape]:
@@ -256,9 +293,10 @@ def _sort_shapes_reading_order(items: list[PositionedShape]) -> list[PositionedS
     return sorted_shapes
 
 
-def extract_pptx(path: Path) -> str:
+def extract_pptx_with_blocks(path: Path) -> ExtractionResult:
     """
-    Extract text, tables, charts, and OCR image content from PPTX presentations.
+    Extract text, tables, charts, and OCR image content from PPTX presentations
+    as structured DocumentBlocks along with canonical flattened text.
     - Preserves visual reading order using dynamic vertical-overlap grouping.
     - Unpacks grouped shapes recursively with exact coordinate transform composition.
     - Formats tables and charts as structured markdown tables.
@@ -266,16 +304,44 @@ def extract_pptx(path: Path) -> str:
     """
     presentation = Presentation(str(path))
     slides_output: list[str] = []
+    all_blocks: list[DocumentBlock] = []
 
-    for slide in presentation.slides:
+    for slide_idx, slide in enumerate(presentation.slides):
+        slide_num = slide_idx + 1
+
+        # Detect slide title if available
+        slide_title = ""
+        try:
+            if slide.shapes.title and slide.shapes.title.has_text_frame:
+                slide_title = fix_line_spacing(slide.shapes.title.text_frame.text.strip())
+        except Exception:
+            pass
+
         positioned_shapes = _flatten_shapes(slide.shapes)
         sorted_shapes = _sort_shapes_reading_order(positioned_shapes)
 
         slide_contents: list[str] = []
         for pos_shape in sorted_shapes:
-            content = _extract_shape_content(pos_shape.shape)
+            content, b_type, meta = _extract_shape_content_typed(pos_shape.shape)
             if content:
                 slide_contents.append(content)
+                if not slide_title and b_type == "heading":
+                    slide_title = content.split("\n")[0].strip()
+
+                heading_path = [slide_title] if slide_title else []
+                all_blocks.append(
+                    DocumentBlock(
+                        block_index=len(all_blocks),
+                        block_type=b_type,
+                        text=content,
+                        slide_number=slide_num,
+                        heading_path=heading_path,
+                        metadata={
+                            **meta,
+                            "bbox": [pos_shape.x_min, pos_shape.y_min, pos_shape.x_max, pos_shape.y_max],
+                        },
+                    )
+                )
 
         # Speaker notes (if present)
         if slide.has_notes_slide:
@@ -283,9 +349,29 @@ def extract_pptx(path: Path) -> str:
             if notes_tf and notes_tf.text.strip():
                 notes_text = fix_line_spacing(notes_tf.text.strip())
                 if notes_text:
-                    slide_contents.append(f"Notes:\n{notes_text}")
+                    note_content = f"Notes:\n{notes_text}"
+                    slide_contents.append(note_content)
+                    all_blocks.append(
+                        DocumentBlock(
+                            block_index=len(all_blocks),
+                            block_type="paragraph",
+                            text=note_content,
+                            slide_number=slide_num,
+                            heading_path=[slide_title] if slide_title else [],
+                            metadata={"type": "speaker_notes"},
+                        )
+                    )
 
         if slide_contents:
             slides_output.append("\n\n".join(slide_contents))
 
-    return "\n\n".join(slides_output).strip()
+    full_text = "\n\n".join(slides_output).strip()
+    return ExtractionResult(text=full_text, blocks=all_blocks)
+
+
+def extract_pptx(path: Path) -> str:
+    """
+    Backward-compatible entry point returning plain extracted text.
+    """
+    return extract_pptx_with_blocks(path).text
+

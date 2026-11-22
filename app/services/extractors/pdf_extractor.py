@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -6,6 +7,7 @@ import cv2
 import numpy as np
 import pymupdf
 
+from app.schemas.document_block import DocumentBlock, ExtractionResult
 from app.services.extractors.table_utils import format_table_as_markdown
 from app.services.ocr_service import (
     fix_line_spacing,
@@ -29,9 +31,10 @@ def _bbox_overlap_ratio(box1: tuple[float, float, float, float], box2: tuple[flo
     return inter_area / area1
 
 
-def extract_pdf(path: Path) -> str:
+def extract_pdf_with_blocks(path: Path) -> ExtractionResult:
     """
-    Extract text, tables, and image content from PDF files.
+    Extract text, tables, and image content from PDF files as structured DocumentBlocks
+    along with canonical flattened text.
     - Native digital text is preferred for high accuracy.
     - Structured tables are extracted as markdown tables.
     - Scanned pages are processed with OCR.
@@ -41,11 +44,13 @@ def extract_pdf(path: Path) -> str:
     """
     pdf_document = pymupdf.open(str(path))
     pages_output: list[str] = []
+    all_blocks: list[DocumentBlock] = []
 
     scale = 2.0  # Rendering scale for OCR
 
     for page_index in range(len(pdf_document)):
         page = pdf_document[page_index]
+        page_num = page_index + 1
 
         # 1. Extract structured tables
         table_bboxes_with_content: list[tuple[float, float, float, float]] = []
@@ -70,10 +75,11 @@ def extract_pdf(path: Path) -> str:
                             "x_min": tab.bbox[0],
                             "x_max": tab.bbox[2],
                             "content": md.strip(),
+                            "metadata": {"bbox": list(tab.bbox), "rows": len(extracted_data)},
                         }
                     )
         except Exception as exc:
-            logger.warning("Table extraction failed on page %d: %s", page_index + 1, exc)
+            logger.warning("Table extraction failed on page %d: %s", page_num, exc)
 
         # 2. Extract native text blocks
         raw_blocks = page.get_text("blocks")
@@ -99,9 +105,17 @@ def extract_pdf(path: Path) -> str:
             fixed_lines = [fix_line_spacing(l) for l in text.split("\n") if l.strip()]
             fixed_text = "\n".join(fixed_lines)
 
+            # Determine semantic block type
+            if fixed_text.startswith(("- ", "* ", "• ")) or re.match(r"^\d+\.\s", fixed_text):
+                sem_type = "list_item"
+            elif fixed_text.startswith("```"):
+                sem_type = "code"
+            else:
+                sem_type = "paragraph"
+
             native_blocks.append(
                 {
-                    "type": "native_text",
+                    "type": sem_type,
                     "bbox": (b[0], b[1], b[2], b[3]),
                     "x_min": b[0],
                     "y_min": b[1],
@@ -109,6 +123,7 @@ def extract_pdf(path: Path) -> str:
                     "y_max": b[3],
                     "height": max(b[3] - b[1], 1.0),
                     "content": fixed_text,
+                    "metadata": {"bbox": [b[0], b[1], b[2], b[3]], "source": "native"},
                 }
             )
 
@@ -123,9 +138,46 @@ def extract_pdf(path: Path) -> str:
                 np.frombuffer(pixmap.tobytes("png"), dtype=np.uint8),
                 cv2.IMREAD_COLOR,
             )
-            ocr_text = run_ocr(img).strip()
-            if ocr_text:
-                pages_output.append(ocr_text)
+            detections = run_ocr_raw(img, min_score=0.35)
+            scanned_page_texts: list[str] = []
+            if detections:
+                ocr_blocks = reconstruct_layout_blocks(detections)
+                for blk in ocr_blocks:
+                    content = blk["content"].strip()
+                    if content:
+                        scanned_page_texts.append(content)
+                        all_blocks.append(
+                            DocumentBlock(
+                                block_index=len(all_blocks),
+                                block_type="ocr_block",
+                                text=content,
+                                page_number=page_num,
+                                metadata={
+                                    "bbox": [
+                                        blk["x_min"] / scale,
+                                        blk["y_min"] / scale,
+                                        blk["x_max"] / scale,
+                                        blk["y_max"] / scale,
+                                    ],
+                                    "source": "ocr",
+                                },
+                            )
+                        )
+                if scanned_page_texts:
+                    pages_output.append("\n\n".join(scanned_page_texts))
+            else:
+                ocr_text = run_ocr(img).strip()
+                if ocr_text:
+                    pages_output.append(ocr_text)
+                    all_blocks.append(
+                        DocumentBlock(
+                            block_index=len(all_blocks),
+                            block_type="ocr_block",
+                            text=ocr_text,
+                            page_number=page_num,
+                            metadata={"source": "ocr"},
+                        )
+                    )
             continue
 
         # Case B: Mixed content or potentially has image text
@@ -178,12 +230,21 @@ def extract_pdf(path: Path) -> str:
                     if content:
                         page_elements.append(
                             {
-                                "type": "ocr_text",
+                                "type": "ocr_block",
                                 "y_min": blk["y_min"] / scale,
                                 "y_max": blk["y_max"] / scale,
                                 "x_min": blk["x_min"] / scale,
                                 "x_max": blk["x_max"] / scale,
                                 "content": content,
+                                "metadata": {
+                                    "bbox": [
+                                        blk["x_min"] / scale,
+                                        blk["y_min"] / scale,
+                                        blk["x_max"] / scale,
+                                        blk["y_max"] / scale,
+                                    ],
+                                    "source": "ocr",
+                                },
                             }
                         )
 
@@ -209,12 +270,31 @@ def extract_pdf(path: Path) -> str:
         for row in rows:
             row.sort(key=lambda it: it["x_min"])
             for it in row:
-                if it["content"]:
-                    ordered_contents.append(it["content"])
+                c = it["content"]
+                if c:
+                    ordered_contents.append(c)
+                    all_blocks.append(
+                        DocumentBlock(
+                            block_index=len(all_blocks),
+                            block_type=it["type"],
+                            text=c,
+                            page_number=page_num,
+                            metadata=it.get("metadata", {}),
+                        )
+                    )
 
         if ordered_contents:
             pages_output.append("\n\n".join(ordered_contents))
 
     pdf_document.close()
 
-    return "\n\n".join(pages_output).strip()
+    full_text = "\n\n".join(pages_output).strip()
+    return ExtractionResult(text=full_text, blocks=all_blocks)
+
+
+def extract_pdf(path: Path) -> str:
+    """
+    Backward-compatible entry point returning plain extracted text.
+    """
+    return extract_pdf_with_blocks(path).text
+
